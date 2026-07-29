@@ -14,7 +14,10 @@ import torch.distributed as dist
 import torch.utils.data.distributed
 import matplotlib.pyplot as plt
 
-sys.path.append("..")
+# Resolve everything relative to this file so the script can be run from any
+# working directory (e.g. the repo root).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(_HERE, ".."))
 from utils.utils import *
 from utils import KD_loss
 from torchvision import datasets, transforms
@@ -39,8 +42,23 @@ parser.add_argument("--epochs", type=int, default=256, help="num of training epo
 parser.add_argument("--learning_rate", type=float, default=0.001, help="init learning rate")
 parser.add_argument("--momentum", type=float, default=0.9, help="momentum")
 parser.add_argument("--weight_decay", type=float, default=0, help="weight decay")
-parser.add_argument("--save", type=str, default="./models", help="path for saving trained models")
-parser.add_argument("--data", metavar="DIR", help="path to dataset")
+parser.add_argument(
+    "--save",
+    type=str,
+    default=os.path.join(_HERE, "models"),
+    help="path for saving trained models",
+)
+parser.add_argument(
+    "--data",
+    metavar="DIR",
+    default=os.path.join(_HERE, "..", ".."),
+    help="path to the directory containing cifar-10-batches-py (default: repo root)",
+)
+parser.add_argument(
+    "--resume",
+    action="store_true",
+    help="continue from checkpoint.pth.tar in --save (default: start from scratch)",
+)
 parser.add_argument("--label_smooth", type=float, default=0.1, help="label smoothing")
 parser.add_argument("--teacher", type=str, default="resnet20", help="teacher model")
 parser.add_argument("--student", type=str, default="resnet20", help="student model")
@@ -69,8 +87,8 @@ resnet_dict = {
 }
 CLASSES = 10
 
-if not os.path.exists("log"):
-    os.mkdir("log")
+LOG_DIR = os.path.join(_HERE, "log")
+os.makedirs(LOG_DIR, exist_ok=True)
 
 log_format = "%(asctime)s %(message)s"
 logging.basicConfig(
@@ -79,7 +97,7 @@ logging.basicConfig(
     format=log_format,
     datefmt="%m/%d %I:%M:%S %p",
 )
-fh = logging.FileHandler(os.path.join("log/log.txt"))
+fh = logging.FileHandler(os.path.join(LOG_DIR, "log.txt"))
 fh.setFormatter(logging.Formatter(log_format))
 logging.getLogger().addHandler(fh)
 
@@ -162,12 +180,21 @@ def main():
         "checkpoint.pth.tar",
     )
     if os.path.exists(checkpoint_tar):
-        logging.info("loading checkpoint {} ..........".format(checkpoint_tar))
-        checkpoint = torch.load(checkpoint_tar)
-        start_epoch = checkpoint["epoch"] + 1
-        best_top1_acc = checkpoint["best_top1_acc"]
-        model_student.load_state_dict(checkpoint["state_dict"], strict=False)
-        logging.info("loaded checkpoint {} epoch = {}".format(checkpoint_tar, checkpoint["epoch"]))
+        if args.resume:
+            logging.info("loading checkpoint {} ..........".format(checkpoint_tar))
+            checkpoint = torch.load(checkpoint_tar)
+            start_epoch = checkpoint["epoch"] + 1
+            best_top1_acc = checkpoint["best_top1_acc"]
+            model_student.load_state_dict(checkpoint["state_dict"], strict=False)
+            logging.info("loaded checkpoint {} epoch = {}".format(checkpoint_tar, checkpoint["epoch"]))
+        else:
+            # Resuming silently continues a previous run and can skip training
+            # entirely, which quietly invalidates a comparison. Opt in instead.
+            logging.warning(
+                "found an existing checkpoint at %s - starting from scratch and "
+                "overwriting it. Pass --resume to continue that run instead.",
+                checkpoint_tar,
+            )
 
     # adjust the learning rate according to the checkpoint
     for epoch in range(start_epoch):
@@ -186,7 +213,13 @@ def main():
     )
     val_transforms = transforms.Compose([transforms.ToTensor(), normalize])
 
-    train_dataset = datasets.CIFAR10(args.data, train=True, transform=train_transforms, download=True)
+    # The dataset ships with the repo, so only download when it is absent.
+    need_download = not os.path.isdir(os.path.join(args.data, "cifar-10-batches-py"))
+    logging.info("dataset root: %s (download=%s)", os.path.abspath(args.data), need_download)
+
+    train_dataset = datasets.CIFAR10(
+        args.data, train=True, transform=train_transforms, download=need_download
+    )
     val_dataset = datasets.CIFAR10(args.data, train=False, transform=val_transforms)
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -213,7 +246,7 @@ def main():
         globalVal.epoch = float(epoch)
 
         if epoch % 10 == 0:
-            fname = "epoch" + str(epoch) + ".png"
+            fname = os.path.join(LOG_DIR, "epoch" + str(epoch) + ".png")
             plt.figure(1)
             plt.clf()
             plt.hist(

@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Training artifacts
+# run.sh writes logs here, train.py writes checkpoints to
+# models/<student>_<n_bit>bit_quantize_downsample_<bool>/
+log/
+*.pth.tar
+# weight-distribution plots train.py dumps every 10 epochs
+AO_QAT/**/epoch*.png
+
+# Keep the downloaded pretrained checkpoints (models/*.th), ignore everything
+# else that lands in the same directory during training.
+AO_QAT/resnet_cifar10/models/*
+!AO_QAT/resnet_cifar10/models/*.th
+AO_QAT/resnet_imagenet/models/*
+!AO_QAT/resnet_imagenet/models/*.th
+
+# The extracted CIFAR-10 (cifar-10-batches-py/) is committed on purpose.
+# The archive torchvision downloads is 163 MB, over GitHub's 100 MB file limit.
+cifar-10-python.tar.gz
+
+# ImageNet is not redistributable - point --data at a local copy instead.
+imagenet/
+ILSVRC*/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

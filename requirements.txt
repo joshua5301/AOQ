@@ -1,0 +1,20 @@
+# AOQ dependencies.
+#
+# Google Colab already ships a CUDA-enabled torch/torchvision. Installing this
+# file there is safe: the pinned lower bounds are below Colab's versions, so pip
+# keeps the preinstalled wheels instead of pulling a CPU-only build.
+#
+#   pip install -r requirements.txt
+#
+# For a local environment, install torch first from https://pytorch.org so that
+# the CUDA build matches your driver, then run the command above.
+
+torch>=2.0
+torchvision>=0.15
+
+numpy>=1.24,<2.0
+pillow>=9.0
+matplotlib>=3.5
+
+# toy_example/plot.py only
+pandas>=1.5

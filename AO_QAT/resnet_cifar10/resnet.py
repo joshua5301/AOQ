@@ -8,11 +8,16 @@ import matplotlib.pyplot as plt
 
 __all__ = ["resnet20", "resnet32", "resnet44", "resnet110"]
 
+import os
+
+_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+
+# Option A (paper-original) checkpoints from akamaster/pytorch_resnet_cifar10.
 model_path = {
-    "resnet20": "./models/resnet20-optionB.th",
-    "resnet32": "./models/resnet32-d509ac18.th",
-    "resnet44": "./models/resnet44-014dd654.th",
-    "resnet110": "./models/resnet110-1d1ed7c2.th",
+    "resnet20": os.path.join(_MODEL_DIR, "resnet20-12fca82f.th"),
+    "resnet32": os.path.join(_MODEL_DIR, "resnet32-d509ac18.th"),
+    "resnet44": os.path.join(_MODEL_DIR, "resnet44-014dd654.th"),
+    "resnet110": os.path.join(_MODEL_DIR, "resnet110-1d1ed7c2.th"),
 }
 
 
@@ -53,24 +58,31 @@ class BasicBlock(nn.Module):
         self.bn2 = nn.BatchNorm2d(planes)
         self.shortcut = nn.Sequential()
         if stride != 1 or inplanes != planes:
-            # self.shortcut = LambdaLayer(
-            #     lambda x: F.pad(
-            #         x[:, :, ::2, ::2],
-            #         (0, 0, 0, 0, planes // 4, planes // 4),
-            #         "constant",
-            #         0,
-            #     )
-            # )
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(
-                    inplanes,
-                    self.expansion * planes,
-                    kernel_size=1,
-                    stride=stride,
-                    bias=False,
-                ),
-                nn.BatchNorm2d(self.expansion * planes),
+            # Option A (He et al.): parameter-free shortcut, stride-2 subsampling
+            # with zero padding. This is the standard backbone for CIFAR-10 QAT
+            # experiments and matches the released pretrained checkpoints.
+            # Note: it carries no weights, so no shortcut is quantized here.
+            self.shortcut = LambdaLayer(
+                lambda x: F.pad(
+                    x[:, :, ::2, ::2],
+                    (0, 0, 0, 0, planes // 4, planes // 4),
+                    "constant",
+                    0,
+                )
             )
+            # Option B (1x1 conv + BN) shortcut, kept for reference. Switching to
+            # it makes the downsample layers quantizable, but the released
+            # checkpoints above do not contain these weights.
+            # self.shortcut = nn.Sequential(
+            #     nn.Conv2d(
+            #         inplanes,
+            #         self.expansion * planes,
+            #         kernel_size=1,
+            #         stride=stride,
+            #         bias=False,
+            #     ),
+            #     nn.BatchNorm2d(self.expansion * planes),
+            # )
 
     def forward(self, x: Tensor) -> Tensor:
         out = F.relu(self.bn1(self.conv1(x)))
@@ -144,12 +156,26 @@ def _resnet(
     model = ResNet(block, layers, **kwargs)
 
     if pretrained:
-        checkpoint = torch.load(model_path[arch])
+        path = model_path[arch]
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"pretrained checkpoint for {arch} not found: {path}\n"
+                f"download it with: bash download_models.sh"
+            )
+        checkpoint = torch.load(path, map_location="cpu")
         state_dict = OrderedDict()
         for k, v in checkpoint["state_dict"].items():
-            if k.startswith("module."):
-                state_dict[k[7:]] = v
-        model.load_state_dict(state_dict, strict=False)
+            state_dict[k[7:] if k.startswith("module.") else k] = v
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        # Guard against silently loading an incompatible checkpoint (e.g. an
+        # option A checkpoint into an option B model): a single unloaded
+        # shortcut collapses accuracy to chance level.
+        if missing or unexpected:
+            raise RuntimeError(
+                f"checkpoint {os.path.basename(path)} does not match {arch}\n"
+                f"  missing keys:    {missing}\n"
+                f"  unexpected keys: {unexpected}"
+            )
     return model
 
 
