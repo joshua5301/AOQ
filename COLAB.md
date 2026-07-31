@@ -35,6 +35,10 @@ Everything else is an env var, set inline before `bash`:
 | var | default | meaning |
 |---|---|---|
 | `LOSS` | `kd` | `kd` distills from the teacher, `ce` uses the hard labels |
+| `W_QUANTIZER` | `aoq` | weight quantizer; `lsq` is the uniform baseline |
+| `QVR_LAMBDA` | `0` | QVR penalty weight (0 = off); implies `W_QUANTIZER=lsq` |
+| `QVR_MEASURE` | `sr` | `sr` or `gaussian` |
+| `QVR_SIGMA` | `0.1` | Gaussian width, in units of `step_size` |
 | `OPTIMIZER` | `adam` | `adam`, `adamw`, or `sgd` |
 | `EPOCHS` | `250` | training epochs |
 | `BATCH_SIZE` | `256` | |
@@ -54,6 +58,27 @@ The default `kd` loss is pure KL against the teacher and **ignores the labels
 entirely** (`utils/KD_loss.py`: "Target is ignored at training time"). `ce`
 scores against the labels instead, needs no teacher, and therefore skips its
 forward pass each step.
+
+### QVR
+
+Quantization-aware Variance Regularization penalises `L + lam*sqrt(R)`, with
+`R = sum p(1-p) gain^2` the rounding-induced loss variance. It needs a uniform
+grid, so `W_QUANTIZER=lsq` is set for you when it is on.
+
+```python
+!QVR_LAMBDA=10 bash AO_QAT/resnet_cifar10/run.sh resnet20 2
+!QVR_LAMBDA=10 QVR_MEASURE=gaussian QVR_SIGMA=0.1 bash AO_QAT/resnet_cifar10/run.sh resnet20 2
+```
+
+It adds one line per epoch:
+
+```
+qvr    epoch   0  lambda 1.0000e+01  std 8.1e-01  force/grad 1.02e-01  pull/step 1.55e-06
+```
+
+Tune `QVR_LAMBDA` by `pull/step` — the fraction of a quantization bin the
+penalty drags a weight in one step. A 250-epoch run at batch 256 is ~49k
+steps, so `pull/step ~ 2e-5` is roughly "one bin over the whole run".
 
 `adamw` with `WEIGHT_DECAY=0` is exactly Adam — the only difference between
 them is how the decay term is applied, so it does nothing at 0. `sgd` needs its
