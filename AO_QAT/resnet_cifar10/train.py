@@ -28,6 +28,21 @@ import quan
 from globalVal import globalVal
 
 
+def run_dir(args):
+    """Directory name identifying a run.
+
+    The optimizer is part of the identity: without it an sgd run would silently
+    overwrite the adam baseline's checkpoints. Only non-default optimizers add
+    a suffix, so existing adam paths are unchanged.
+    """
+    tag = "{}_{}bit_quantize_downsample_{}".format(
+        args.student, args.n_bit, args.quantize_downsample
+    )
+    if args.optimizer != "adam":
+        tag += "_" + args.optimizer
+    return tag
+
+
 def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -68,6 +83,14 @@ parser.add_argument(
     type=str,
     default="True",
     help="quantize downsampling layer or not",
+)
+parser.add_argument(
+    "--optimizer",
+    type=str,
+    default="adam",
+    choices=["adam", "adamw", "sgd"],
+    help="optimizer (default: adam, the original). adamw decouples weight decay; "
+    "sgd uses --momentum. All three keep the alpha group at lr/10",
 )
 parser.add_argument(
     "-j",
@@ -158,17 +181,41 @@ def main():
     other_parameters1 = list(filter(lambda p: id(p) not in weight_parameters_id, all_parameters))
     other_parameters = list(filter(lambda p: id(p) not in alpha_parameters_id, other_parameters1))
 
-    optimizer = torch.optim.Adam(
-        [
-            {"params": alpha_parameters, "lr": args.learning_rate / 10},
-            {"params": other_parameters, "lr": args.learning_rate},
-            {
-                "params": weight_parameters,
-                # "weight_decay": args.weight_decay,
-                "lr": args.learning_rate,
-            },
-        ],
-        betas=(0.9, 0.999),
+    param_groups = [
+        {"params": alpha_parameters, "lr": args.learning_rate / 10},
+        {"params": other_parameters, "lr": args.learning_rate},
+        {
+            "params": weight_parameters,
+            "lr": args.learning_rate,
+        },
+    ]
+    if args.optimizer == "sgd":
+        optimizer = torch.optim.SGD(
+            param_groups,
+            lr=args.learning_rate,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+        )
+    else:
+        # weight_decay defaults to 0, so the adam branch is exactly the original
+        # optimizer. AdamW's own default is 0.01, hence passing it explicitly.
+        optimizer_cls = torch.optim.AdamW if args.optimizer == "adamw" else torch.optim.Adam
+        optimizer = optimizer_cls(
+            param_groups,
+            betas=(0.9, 0.999),
+            weight_decay=args.weight_decay,
+        )
+    if args.optimizer == "adamw" and args.weight_decay == 0:
+        logging.warning(
+            "--optimizer=adamw with --weight_decay=0 is exactly Adam; the whole "
+            "difference between them is how the decay term is applied."
+        )
+    logging.info(
+        "optimizer: %s lr=%g momentum=%g weight_decay=%g",
+        args.optimizer,
+        args.learning_rate,
+        args.momentum,
+        args.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: (1.0 - step / args.epochs), last_epoch=-1)
     start_epoch = 0
@@ -176,7 +223,7 @@ def main():
 
     checkpoint_tar = os.path.join(
         args.save,
-        args.student + "_" + str(args.n_bit) + "bit_quantize_downsample_" + str(args.quantize_downsample),
+        run_dir(args),
         "checkpoint.pth.tar",
     )
     if os.path.exists(checkpoint_tar):
@@ -239,7 +286,9 @@ def main():
     model_student = model_student.to(device)
     epoch = start_epoch
 
-    print("教师网络的精度")
+    # ASCII on purpose: a Windows console defaults to a legacy codepage
+    # (cp949, cp1252) and raises UnicodeEncodeError on anything outside it.
+    logging.info("teacher accuracy")
     validate(-2, val_loader, model_teacher, criterion, args)
 
     while epoch < args.epochs:
@@ -282,7 +331,7 @@ def main():
             is_best,
             os.path.join(
                 args.save,
-                args.student + "_" + str(args.n_bit) + "bit_quantize_downsample_" + str(args.quantize_downsample),
+                run_dir(args),
             ),
         )
 

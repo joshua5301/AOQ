@@ -276,7 +276,9 @@ def main():
         pin_memory=True,
     )
 
-    print("教师网络的精度")
+    # ASCII on purpose: a Windows console defaults to a legacy codepage
+    # (cp949, cp1252) and raises UnicodeEncodeError on anything outside it.
+    logging.info("teacher accuracy")
     validate(-2, val_loader, model_teacher, criterion, args)
     # train the model
     model_student = model_student.to(device)

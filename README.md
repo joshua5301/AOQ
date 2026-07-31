@@ -51,8 +51,18 @@ In this work, we found that
 
 ### 2. Run Command
 ```
-bash run.sh architecture n_bits quantize_downsampling
+bash AO_QAT/resnet_cifar10/run.sh architecture n_bits quantize_downsampling
 ```
+
+Env overrides: `OPTIMIZER` (`adam` default, or `adamw` / `sgd`), `EPOCHS`,
+`BATCH_SIZE`, `LR`, `WEIGHT_DECAY`, `MOMENTUM`, `SAVE`, `RESUME`.
+
+```
+OPTIMIZER=sgd LR=0.01 bash AO_QAT/resnet_cifar10/run.sh resnet20 2
+```
+
+For Colab (setup, Drive checkpoints, resuming after a disconnect) see
+[COLAB.md](COLAB.md).
 
 
 ## Toy Example
