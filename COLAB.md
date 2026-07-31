@@ -34,6 +34,7 @@ Everything else is an env var, set inline before `bash`:
 
 | var | default | meaning |
 |---|---|---|
+| `LOSS` | `kd` | `kd` distills from the teacher, `ce` uses the hard labels |
 | `OPTIMIZER` | `adam` | `adam`, `adamw`, or `sgd` |
 | `EPOCHS` | `250` | training epochs |
 | `BATCH_SIZE` | `256` | |
@@ -44,9 +45,15 @@ Everything else is an env var, set inline before `bash`:
 | `RESUME` | unset | set to `1` to continue from a checkpoint |
 
 ```python
+!LOSS=ce bash AO_QAT/resnet_cifar10/run.sh resnet20 2
 !OPTIMIZER=sgd LR=0.01 bash AO_QAT/resnet_cifar10/run.sh resnet20 2
 !OPTIMIZER=adamw WEIGHT_DECAY=0.01 bash AO_QAT/resnet_cifar10/run.sh resnet20 2
 ```
+
+The default `kd` loss is pure KL against the teacher and **ignores the labels
+entirely** (`utils/KD_loss.py`: "Target is ignored at training time"). `ce`
+scores against the labels instead, needs no teacher, and therefore skips its
+forward pass each step.
 
 `adamw` with `WEIGHT_DECAY=0` is exactly Adam — the only difference between
 them is how the decay term is applied, so it does nothing at 0. `sgd` needs its
@@ -85,12 +92,22 @@ overwrites** — it warns when it does. Add `RESUME=1` to continue instead:
 when the optimizer is not the default — so the arms never overwrite each
 other.
 
-```python
-!grep "acc@1" AO_QAT/resnet_cifar10/log/resnet20_2bit_quantize_downsample_True/training.txt | tail -5
+Two lines per epoch, one for training and one for the test set:
+
+```
+train  epoch   0  lr 9.960e-04  loss 6.5900e-01  acc@1  79.33  acc@5  98.87  9s
+test   epoch   0  loss 5.8000e-01  acc@1  81.01  acc@5  98.95
 ```
 
-The first `acc@1` line is the full-precision teacher, printed once before
-training starts — skip it when reading off the best student accuracy.
+```python
+!grep "^.*test   epoch" AO_QAT/resnet_cifar10/log/resnet20_2bit_quantize_downsample_True/training.txt | tail -5
+```
+
+`test epoch -2` is the full-precision teacher, evaluated once before training
+starts — skip it when reading off the best student accuracy.
+
+Pass `--print_freq=50` (via `train.py` directly) for the old per-batch progress
+lines and the full model dump.
 
 ## Gotchas
 

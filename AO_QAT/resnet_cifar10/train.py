@@ -31,13 +31,15 @@ from globalVal import globalVal
 def run_dir(args):
     """Directory name identifying a run.
 
-    The optimizer is part of the identity: without it an sgd run would silently
-    overwrite the adam baseline's checkpoints. Only non-default optimizers add
-    a suffix, so existing adam paths are unchanged.
+    The loss and the optimizer are part of the identity: without them a ce or
+    sgd run would silently overwrite the kd/adam baseline's checkpoints. Only
+    non-default values add a suffix, so existing paths are unchanged.
     """
     tag = "{}_{}bit_quantize_downsample_{}".format(
         args.student, args.n_bit, args.quantize_downsample
     )
+    if args.loss != "kd":
+        tag += "_" + args.loss
     if args.optimizer != "adam":
         tag += "_" + args.optimizer
     return tag
@@ -85,12 +87,29 @@ parser.add_argument(
     help="quantize downsampling layer or not",
 )
 parser.add_argument(
+    "--loss",
+    type=str,
+    default="kd",
+    choices=["kd", "ce"],
+    help="training loss: kd = KL against the teacher, which ignores the labels "
+    "entirely (see utils/KD_loss.py); ce = hard-label cross entropy, which "
+    "needs no teacher and skips its forward pass",
+)
+parser.add_argument(
     "--optimizer",
     type=str,
     default="adam",
     choices=["adam", "adamw", "sgd"],
     help="optimizer (default: adam, the original). adamw decouples weight decay; "
     "sgd uses --momentum. All three keep the alpha group at lr/10",
+)
+parser.add_argument(
+    "--print_freq",
+    type=int,
+    default=0,
+    help="iterations between per-batch progress lines, and 0 for one summary "
+    "line per epoch instead. The default keeps a 250-epoch run readable; "
+    "setting it also re-enables the startup model dump",
 )
 parser.add_argument(
     "-j",
@@ -151,18 +170,29 @@ def main():
         args.quantize_downsample = False
 
     model_student = resnet_dict[args.student](pretrained=True)
-    print(model_student)
     modules_to_replace = quan.find_modules_to_quantize(model_student, args.n_bit)
+    n_quantized = len(modules_to_replace)
     model_student = quan.replace_module_by_names(model_student, modules_to_replace)
     model_student = model_student.to(device)
-    logging.info("student:")
-    logging.info(model_student)
+    # The full module repr is ~150 lines and was printed twice; print it only
+    # when per-batch logging is on anyway.
+    if args.print_freq:
+        logging.info("student:\n%s", model_student)
+    else:
+        logging.info(
+            "student: %s, %d quantized layers, %s params",
+            args.student,
+            n_quantized,
+            "{:,}".format(sum(p.numel() for p in model_student.parameters())),
+        )
 
     criterion = nn.CrossEntropyLoss()
     criterion = criterion.to(device)
     criterion_smooth = CrossEntropyLabelSmooth(CLASSES, args.label_smooth)
     criterion_smooth = criterion_smooth.to(device)
     criterion_kd = KD_loss.DistributionLoss()
+    train_criterion = criterion_kd if args.loss == "kd" else criterion
+    logging.info("training loss: %s", args.loss)
 
     all_parameters = model_student.parameters()
     weight_parameters = []
@@ -170,10 +200,12 @@ def main():
 
     for pname, p in model_student.named_parameters():
         if p.ndimension() == 4 and "bias" not in pname:
-            print("weight_param:", pname)
+            if args.print_freq:
+                logging.info("weight_param: %s", pname)
             weight_parameters.append(p)
         elif "quan_a_fn.a" in pname or "quan_a_fn.scale" in pname or "quan_a_fn.start" in pname:
-            print("alpha_param:", pname)
+            if args.print_freq:
+                logging.info("alpha_param: %s", pname)
             alpha_parameters.append(p)
 
     weight_parameters_id = list(map(id, weight_parameters))
@@ -310,7 +342,7 @@ def main():
             train_loader,
             model_student,
             model_teacher,
-            criterion_kd,
+            train_criterion,
             optimizer,
             scheduler,
         )
@@ -337,8 +369,8 @@ def main():
 
         epoch += 1
 
-    training_time = (time.time() - start_t) / 36000
-    print("total training time = {} hours".format(training_time))
+    training_time = (time.time() - start_t) / 3600
+    logging.info("total training time = %.2f hours", training_time)
 
 
 def train(epoch, train_loader, model_student, model_teacher, criterion, optimizer, scheduler):
@@ -361,21 +393,28 @@ def train(epoch, train_loader, model_student, model_teacher, criterion, optimize
 
     for param_group in optimizer.param_groups:
         cur_lr = param_group["lr"]
-    print("learning_rate:", cur_lr)
+    print_freq = getattr(args, "print_freq", 0)
+    loss_type = getattr(args, "loss", "kd")
 
     for i, (images, target) in enumerate(train_loader):
         data_time.update(time.time() - end)
         images = images.to(device)
         target = target.to(device)
 
-        # compute outputy
+        # compute output. kd scores against the teacher's soft distribution and
+        # ignores the labels; ce scores against the labels and needs no teacher,
+        # so its forward pass is skipped entirely.
         logits_student = model_student(images)
-        logits_teacher = model_teacher(images)
+        if loss_type == "kd":
+            reference = model_teacher(images)
+        else:
+            reference = target
+
         if globalVal.epoch <= 150:
             globalVal.loss = 0.0
-            loss = criterion(logits_student, logits_teacher)
+            loss = criterion(logits_student, reference)
         else:
-            loss1 = criterion(logits_student, logits_teacher)
+            loss1 = criterion(logits_student, reference)
             loss2 = globalVal.loss
             globalVal.loss = 0.0
             loss = loss1 + 0.01 * loss2
@@ -396,8 +435,19 @@ def train(epoch, train_loader, model_student, model_teacher, criterion, optimize
         batch_time.update(time.time() - end)
         end = time.time()
 
-        progress.display(i)
+        if print_freq and i % print_freq == 0:
+            progress.display(i)
 
+    # One line per epoch by default; --print_freq re-enables the per-batch ones.
+    logging.info(
+        "train  epoch %3d  lr %.3e  loss %.4e  acc@1 %6.2f  acc@5 %6.2f  %.0fs",
+        epoch,
+        cur_lr,
+        losses.avg,
+        top1.avg,
+        top5.avg,
+        batch_time.sum,
+    )
     return losses.avg, top1.avg, top5.avg
 
 
@@ -431,9 +481,17 @@ def validate(epoch=-1, val_loader=None, model=None, criterion=None, args=None):
             batch_time.update(time.time() - end)
             end = time.time()
 
-            progress.display(i)
+            if getattr(args, "print_freq", 0) and i % args.print_freq == 0:
+                progress.display(i)
 
-        print(" * acc@1 {top1.avg:.3f} acc@5 {top5.avg:.3f}".format(top1=top1, top5=top5))
+        # Keeps the "acc@1" substring so existing log greps still match.
+        logging.info(
+            "test   epoch %3d  loss %.4e  acc@1 %6.2f  acc@5 %6.2f",
+            epoch,
+            losses.avg,
+            top1.avg,
+            top5.avg,
+        )
 
     return losses.avg, top1.avg, top5.avg
 
