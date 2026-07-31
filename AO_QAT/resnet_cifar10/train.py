@@ -38,8 +38,14 @@ def run_dir(args):
     tag = "{}_{}bit_quantize_downsample_{}".format(
         args.student, args.n_bit, args.quantize_downsample
     )
+    if args.w_quantizer != "aoq":
+        tag += "_" + args.w_quantizer
     if args.loss != "kd":
         tag += "_" + args.loss
+    if args.qvr_lambda:
+        tag += "_qvr{:g}_{}".format(args.qvr_lambda, args.qvr_measure)
+        if args.qvr_measure == "gaussian":
+            tag += "_s{:g}".format(args.qvr_sigma)
     if args.optimizer != "adam":
         tag += "_" + args.optimizer
     return tag
@@ -85,6 +91,38 @@ parser.add_argument(
     type=str,
     default="True",
     help="quantize downsampling layer or not",
+)
+parser.add_argument(
+    "--w_quantizer",
+    type=str,
+    default="aoq",
+    choices=["aoq", "lsq"],
+    help="weight quantizer (default: aoq, the paper's method). QVR needs lsq: "
+    "it is defined on a uniform grid, and AOQ decouples its thresholds from "
+    "its levels",
+)
+parser.add_argument(
+    "--qvr_lambda",
+    type=float,
+    default=0.0,
+    help="QVR penalty weight: the objective becomes L + lam*sqrt(R) with "
+    "R = sum p(1-p) gain^2 the rounding-induced loss variance. lam is a "
+    "likelihood-ball radius, sqrt(2B). 0 disables QVR entirely",
+)
+parser.add_argument(
+    "--qvr_measure",
+    type=str,
+    default="sr",
+    choices=["sr", "gaussian"],
+    help="flip-probability measure. sr has no width knob; gaussian takes "
+    "--qvr_sigma and is local to the rounding boundaries",
+)
+parser.add_argument(
+    "--qvr_sigma",
+    type=float,
+    default=0.1,
+    help="Gaussian jitter width in UNITS OF step_size (--qvr_measure=gaussian). "
+    "Coordinates past ~3 sigma from a boundary feel essentially no penalty",
 )
 parser.add_argument(
     "--loss",
@@ -170,7 +208,9 @@ def main():
         args.quantize_downsample = False
 
     model_student = resnet_dict[args.student](pretrained=True)
-    modules_to_replace = quan.find_modules_to_quantize(model_student, args.n_bit)
+    modules_to_replace = quan.find_modules_to_quantize(
+        model_student, args.n_bit, args.w_quantizer
+    )
     n_quantized = len(modules_to_replace)
     model_student = quan.replace_module_by_names(model_student, modules_to_replace)
     model_student = model_student.to(device)
@@ -180,8 +220,9 @@ def main():
         logging.info("student:\n%s", model_student)
     else:
         logging.info(
-            "student: %s, %d quantized layers, %s params",
+            "student: %s, %s quantizer, %d quantized layers, %s params",
             args.student,
+            args.w_quantizer,
             n_quantized,
             "{:,}".format(sum(p.numel() for p in model_student.parameters())),
         )
@@ -193,6 +234,23 @@ def main():
     criterion_kd = KD_loss.DistributionLoss()
     train_criterion = criterion_kd if args.loss == "kd" else criterion
     logging.info("training loss: %s", args.loss)
+
+    qvr = None
+    if args.qvr_lambda > 0.0:
+        if args.w_quantizer != "lsq":
+            raise ValueError("--qvr_lambda requires --w_quantizer=lsq")
+        qvr = quan.QVR(
+            model_student,
+            lam=args.qvr_lambda,
+            measure=args.qvr_measure,
+            sigma=args.qvr_sigma,
+        )
+        logging.info(
+            "qvr: lambda=%g measure=%s%s",
+            args.qvr_lambda,
+            args.qvr_measure,
+            " sigma={:g}*step".format(args.qvr_sigma) if args.qvr_measure == "gaussian" else "",
+        )
 
     all_parameters = model_student.parameters()
     weight_parameters = []
@@ -345,6 +403,7 @@ def main():
             train_criterion,
             optimizer,
             scheduler,
+            qvr,
         )
         valid_obj, valid_top1_acc, valid_top5_acc = validate(epoch, val_loader, model_student, criterion, args)
 
@@ -373,7 +432,7 @@ def main():
     logging.info("total training time = %.2f hours", training_time)
 
 
-def train(epoch, train_loader, model_student, model_teacher, criterion, optimizer, scheduler):
+def train(epoch, train_loader, model_student, model_teacher, criterion, optimizer, scheduler, qvr=None):
     batch_time = AverageMeter("Time", ":6.3f")
     data_time = AverageMeter("Data", ":6.3f")
     losses = AverageMeter("Loss", ":.4e")
@@ -395,6 +454,7 @@ def train(epoch, train_loader, model_student, model_teacher, criterion, optimize
         cur_lr = param_group["lr"]
     print_freq = getattr(args, "print_freq", 0)
     loss_type = getattr(args, "loss", "kd")
+    qvr_meters = {k: AverageMeter(k, ":.4e") for k in ("std", "force_ratio", "pull_per_step")}
 
     for i, (images, target) in enumerate(train_loader):
         data_time.update(time.time() - end)
@@ -429,7 +489,17 @@ def train(epoch, train_loader, model_student, model_teacher, criterion, optimize
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
+        # stage() reads gain AND geometry at w_t; apply() writes after the task
+        # update, decoupled so Adam cannot normalise lambda away.
+        if qvr is not None:
+            qvr.stage()
         optimizer.step()
+        if qvr is not None:
+            qvr.apply(cur_lr)
+            for k, meter in qvr_meters.items():
+                v = qvr.stats.get(k, float("nan"))
+                if v == v:
+                    meter.update(v, 1)
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -448,6 +518,15 @@ def train(epoch, train_loader, model_student, model_teacher, criterion, optimize
         top5.avg,
         batch_time.sum,
     )
+    if qvr is not None:
+        logging.info(
+            "qvr    epoch %3d  lambda %.4e  std %.4e  force/grad %.4e  pull/step %.3e",
+            epoch,
+            qvr.lam,
+            qvr_meters["std"].avg,
+            qvr_meters["force_ratio"].avg,
+            qvr_meters["pull_per_step"].avg,
+        )
     return losses.avg, top1.avg, top5.avg
 
 
