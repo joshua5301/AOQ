@@ -44,8 +44,6 @@ def run_dir(args):
         tag += "_" + args.loss
     if args.qvr_lambda:
         tag += "_qvr{:g}_{}".format(args.qvr_lambda, args.qvr_measure)
-        if args.qvr_measure == "gaussian":
-            tag += "_s{:g}".format(args.qvr_sigma)
     if args.optimizer != "adam":
         tag += "_" + args.optimizer
     return tag
@@ -113,16 +111,10 @@ parser.add_argument(
     "--qvr_measure",
     type=str,
     default="sr",
-    choices=["sr", "gaussian"],
-    help="flip-probability measure. sr has no width knob; gaussian takes "
-    "--qvr_sigma and is local to the rounding boundaries",
-)
-parser.add_argument(
-    "--qvr_sigma",
-    type=float,
-    default=0.1,
-    help="Gaussian jitter width in UNITS OF step_size (--qvr_measure=gaussian). "
-    "Coordinates past ~3 sigma from a boundary feel essentially no penalty",
+    choices=["sr", "cos2"],
+    help="level-offset measure. Neither has a width knob, so --qvr_lambda is "
+    "QVR's only hyperparameter. sr peaks at the grid point (a kink); cos2 is "
+    "the leading Fourier mode of a Gaussian jitter, smooth, and peaks mid-bin",
 )
 parser.add_argument(
     "--loss",
@@ -243,14 +235,8 @@ def main():
             model_student,
             lam=args.qvr_lambda,
             measure=args.qvr_measure,
-            sigma=args.qvr_sigma,
         )
-        logging.info(
-            "qvr: lambda=%g measure=%s%s",
-            args.qvr_lambda,
-            args.qvr_measure,
-            " sigma={:g}*step".format(args.qvr_sigma) if args.qvr_measure == "gaussian" else "",
-        )
+        logging.info("qvr: lambda=%g measure=%s", args.qvr_lambda, args.qvr_measure)
 
     all_parameters = model_student.parameters()
     weight_parameters = []

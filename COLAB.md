@@ -37,8 +37,7 @@ Everything else is an env var, set inline before `bash`:
 | `LOSS` | `kd` | `kd` distills from the teacher, `ce` uses the hard labels |
 | `W_QUANTIZER` | `aoq` | weight quantizer; `lsq` is the uniform baseline |
 | `QVR_LAMBDA` | `0` | QVR penalty weight (0 = off); implies `W_QUANTIZER=lsq` |
-| `QVR_MEASURE` | `sr` | `sr` or `gaussian` |
-| `QVR_SIGMA` | `0.1` | Gaussian width, in units of `step_size` |
+| `QVR_MEASURE` | `sr` | `sr` or `cos2`; neither has a width knob |
 | `OPTIMIZER` | `adam` | `adam`, `adamw`, or `sgd` |
 | `EPOCHS` | `250` | training epochs |
 | `BATCH_SIZE` | `256` | |
@@ -67,7 +66,7 @@ grid, so `W_QUANTIZER=lsq` is set for you when it is on.
 
 ```python
 !QVR_LAMBDA=10 bash AO_QAT/resnet_cifar10/run.sh resnet20 2
-!QVR_LAMBDA=10 QVR_MEASURE=gaussian QVR_SIGMA=0.1 bash AO_QAT/resnet_cifar10/run.sh resnet20 2
+!QVR_LAMBDA=10 QVR_MEASURE=cos2 bash AO_QAT/resnet_cifar10/run.sh resnet20 2
 ```
 
 It adds one line per epoch:
@@ -76,9 +75,18 @@ It adds one line per epoch:
 qvr    epoch   0  lambda 1.0000e+01  std 8.1e-01  force/grad 1.02e-01  pull/step 1.55e-06
 ```
 
-Tune `QVR_LAMBDA` by `pull/step` — the fraction of a quantization bin the
-penalty drags a weight in one step. A 250-epoch run at batch 256 is ~49k
-steps, so `pull/step ~ 2e-5` is roughly "one bin over the whole run".
+`QVR_LAMBDA` is QVR's **only** hyperparameter — neither measure has a width
+knob. Tune it by `pull/step`, the fraction of a quantization bin the penalty
+drags a weight in one step: a 250-epoch run at batch 256 is ~49k steps, so
+`pull/step ~ 2e-5` is roughly "one bin over the whole run". `force_ratio` near
+0.05 is the other target, and it is exactly linear in `QVR_LAMBDA`, so one
+probe epoch is enough to rescale.
+
+The two measures differ in where the force acts: `sr` is maximal at the grid
+point (a kink, so settled weights keep jittering), `cos2` is zero there and
+peaks mid-bin (settled weights are left alone). Their barrier heights are
+identical, but peak force differs by `4/pi`, so **compare arms at matched
+`force_ratio`, not matched `QVR_LAMBDA`**.
 
 `adamw` with `WEIGHT_DECAY=0` is exactly Adam — the only difference between
 them is how the decay term is applied, so it does nothing at 0. `sgd` needs its
@@ -127,6 +135,25 @@ test   epoch   0  loss 5.8000e-01  acc@1  81.01  acc@5  98.95
 ```python
 !grep "^.*test   epoch" AO_QAT/resnet_cifar10/log/resnet20_2bit_quantize_downsample_True/training.txt | tail -5
 ```
+
+To compare arms, `results.sh` pulls the best test accuracy out of every run:
+
+```python
+!bash AO_QAT/resnet_cifar10/results.sh
+```
+
+```
+best@1   epoch  last@1  done  fp@1    run
+-------  -----  ------  ----  ------  ---
+83.50    11     83.50   12    91.48   ..._lsq_qvr10_cos2
+83.04    29     83.04   30    91.48   ..._lsq_qvr10_sr
+82.00    29     82.00   30    91.48   resnet20_2bit_quantize_downsample_True
+```
+
+Sorted best first. `done` is how many epochs finished — **check it before
+comparing**, since a run cut short by a disconnect is not comparable. `fp@1`
+is the full-precision teacher, for reference. Takes an optional glob
+(`results.sh '*qvr*'`) and reads `$LOG` if the logs live on Drive.
 
 `test epoch -2` is the full-precision teacher, evaluated once before training
 starts — skip it when reading off the best student accuracy.

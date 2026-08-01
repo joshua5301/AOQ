@@ -3,7 +3,7 @@
 #   e.g. bash AO_QAT/resnet_cifar10/run.sh resnet20 2 True
 # Runnable from any working directory, including the repo root.
 #
-# Env overrides: LOSS, W_QUANTIZER, QVR_LAMBDA, QVR_MEASURE, QVR_SIGMA,
+# Env overrides: LOSS, W_QUANTIZER, QVR_LAMBDA, QVR_MEASURE,
 #                OPTIMIZER, EPOCHS, BATCH_SIZE, LR, WEIGHT_DECAY, MOMENTUM,
 #                SAVE, RESUME, PYTHON
 #
@@ -17,14 +17,13 @@
 # AOQ decouples its thresholds from its levels and has no such grid.
 #
 #   QVR_LAMBDA=10 bash AO_QAT/resnet_cifar10/run.sh resnet20 2
-#   QVR_LAMBDA=10 QVR_MEASURE=gaussian QVR_SIGMA=0.1 \
-#       bash AO_QAT/resnet_cifar10/run.sh resnet20 2
+#   QVR_LAMBDA=10 QVR_MEASURE=cos2 bash AO_QAT/resnet_cifar10/run.sh resnet20 2
 #
 # Tune QVR_LAMBDA by the logged pull/step -- the fraction of a quantization bin
 # the penalty drags a weight in one step. A 250-epoch run at batch 256 is ~49k
 # steps, so pull/step ~ 2e-5 is roughly "one bin over the whole run".
-# QVR_SIGMA is in units of step_size and only applies to QVR_MEASURE=gaussian;
-# keep it <~ 0.2, above which the two-level truncation starts to bite.
+# QVR_LAMBDA is the only QVR hyperparameter -- neither measure has a width
+# knob. Match force_ratio, not lambda, when comparing sr against cos2.
 set -e
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
@@ -41,7 +40,6 @@ WEIGHT_DECAY=${WEIGHT_DECAY:-0}
 MOMENTUM=${MOMENTUM:-0.9}
 QVR_LAMBDA=${QVR_LAMBDA:-0}
 QVR_MEASURE=${QVR_MEASURE:-sr}
-QVR_SIGMA=${QVR_SIGMA:-0.1}
 PYTHON=${PYTHON:-python3}
 
 # QVR is defined on a uniform grid, so it implies the LSQ quantizer.
@@ -57,13 +55,11 @@ W_QUANTIZER=${W_QUANTIZER:-aoq}
 # mirrors run_dir() in train.py, in the same order, so logs and checkpoints
 # line up. "%g" here matches Python's "{:g}" there.
 QVR_LAMBDA_G=$(printf "%g" "${QVR_LAMBDA}")
-QVR_SIGMA_G=$(printf "%g" "${QVR_SIGMA}")
 TAG=${NETWORK}_${N_BIT}bit_quantize_downsample_${QUAN_DOWNSAMPLE}
 if [ "${W_QUANTIZER}" != "aoq" ]; then TAG=${TAG}_${W_QUANTIZER}; fi
 if [ "${LOSS}" != "kd" ]; then TAG=${TAG}_${LOSS}; fi
 if [ "${QVR_LAMBDA}" != "0" ]; then
     TAG=${TAG}_qvr${QVR_LAMBDA_G}_${QVR_MEASURE}
-    if [ "${QVR_MEASURE}" = "gaussian" ]; then TAG=${TAG}_s${QVR_SIGMA_G}; fi
 fi
 if [ "${OPTIMIZER}" != "adam" ]; then TAG=${TAG}_${OPTIMIZER}; fi
 RESUME_FLAG=""
@@ -80,7 +76,6 @@ echo "[run] ${TAG}  epochs=${EPOCHS} loss=${LOSS} quantizer=${W_QUANTIZER} optim
     --loss="${LOSS}" \
     --qvr_lambda="${QVR_LAMBDA}" \
     --qvr_measure="${QVR_MEASURE}" \
-    --qvr_sigma="${QVR_SIGMA}" \
     --optimizer="${OPTIMIZER}" \
     --epochs="${EPOCHS}" \
     --batch_size="${BATCH_SIZE}" \
