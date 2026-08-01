@@ -44,6 +44,10 @@ def run_dir(args):
         tag += "_" + args.loss
     if args.qvr_lambda:
         tag += "_qvr{:g}_{}".format(args.qvr_lambda, args.qvr_measure)
+        if args.qvr_gain != "sq":
+            tag += "_" + args.qvr_gain
+        if args.qvr_apply != "decoupled":
+            tag += "_" + args.qvr_apply
     if args.optimizer != "adam":
         tag += "_" + args.optimizer
     return tag
@@ -111,10 +115,32 @@ parser.add_argument(
     "--qvr_measure",
     type=str,
     default="sr",
-    choices=["sr", "cos2"],
-    help="level-offset measure. Neither has a width knob, so --qvr_lambda is "
-    "QVR's only hyperparameter. sr peaks at the grid point (a kink); cos2 is "
-    "the leading Fourier mode of a Gaussian jitter, smooth, and peaks mid-bin",
+    choices=["nagel", "sr", "cos2"],
+    help="V profile; none has a width knob, so --qvr_lambda is QVR's only "
+    "hyperparameter. sr peaks at the grid point (a cusp), cos2 is the leading "
+    "Fourier mode of a Gaussian jitter and peaks mid-bin, nagel is the "
+    "prior-work dampening penalty V=u^2 and peaks at the boundary -- roughly "
+    "sr's mirror image",
+)
+parser.add_argument(
+    "--qvr_gain",
+    type=str,
+    default="sq",
+    choices=["sq", "abs", "const"],
+    help="sensitivity weight on V(u). sq = (g*step)^2, the derived one; abs "
+    "and const are ablations isolating what that weight contributes. const is "
+    "NOT prior work -- use --qvr_measure=nagel for that",
+)
+parser.add_argument(
+    "--qvr_apply",
+    type=str,
+    default="decoupled",
+    choices=["decoupled", "coupled"],
+    help="where the penalty lands. decoupled writes w -= lr*lam*grad outside "
+    "the optimizer, so lam is monotone but the penalty's displacement decays "
+    "with the task gradient under Adam. coupled adds it to weight.grad, so "
+    "Adam normalises the sum and the penalty keeps a fixed share of the "
+    "update; read force_ratio there, pull_per_step is undefined",
 )
 parser.add_argument(
     "--loss",
@@ -235,8 +261,13 @@ def main():
             model_student,
             lam=args.qvr_lambda,
             measure=args.qvr_measure,
+            gain=args.qvr_gain,
+            apply_mode=args.qvr_apply,
         )
-        logging.info("qvr: lambda=%g measure=%s", args.qvr_lambda, args.qvr_measure)
+        logging.info(
+            "qvr: lambda=%g measure=%s gain=%s apply=%s",
+            args.qvr_lambda, args.qvr_measure, args.qvr_gain, args.qvr_apply,
+        )
 
     all_parameters = model_student.parameters()
     weight_parameters = []

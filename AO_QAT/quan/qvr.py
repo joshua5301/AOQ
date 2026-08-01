@@ -16,8 +16,8 @@ gradient-norm penalty (rho*||g|| = sqrt(2B) * sigma * ||g||). The name says
 variance because that is the quantity being decomposed; the penalty is its
 square root.
 
-TWO MEASURES
-------------
+THREE V PROFILES
+----------------
 Everything is written in u = the SIGNED distance to the nearest grid point, in
 units of step: with xq = clamp(w/step, Qn, Qp) and r = xq - floor(xq),
 
@@ -27,14 +27,21 @@ units of step: with xq = clamp(w/step, Qn, Qp) and r = xq - floor(xq),
 so u lies in [-0.5, 0.5], the two rounding boundaries sit at u = +-0.5, and
 du/dw = 1/step everywhere -- no sign() anywhere.
 
-Let V be the variance of the LEVEL OFFSET. NEITHER ARM HAS A WIDTH KNOB, so
-lam is QVR's only hyperparameter:
+THREE V PROFILES, none with a width knob, so lam is QVR's only knob. Two are
+genuine level-offset variances; the third is prior work run on the same code:
 
     measure="sr"     V     = |u| (1 - |u|)          stochastic rounding
                      dV/du = sign(u) (1 - 2|u|)
 
     measure="cos2"   V     = sin^2(pi u) / 4        leading Fourier mode
                      dV/du = (pi/4) sin(2 pi u)
+
+    measure="nagel"  V     = u^2                    Nagel et al. 2022 dampening
+                     dV/du = 2 u                    (NOT a variance)
+
+They differ in what the grid point is: a smooth well (nagel), a cusp (sr), or
+flat (cos2). See RELATION TO PRIOR WORK below -- nagel and sr are near mirror
+images, not variations of each other.
 
 WHY sin^2 AND NOT A GAUSSIAN. V is periodic in u, so it has a Fourier series.
 For a Gaussian latent jitter of width sigma the pushforward variance is a
@@ -67,32 +74,31 @@ GRADIENT (gain detached, so only the position channel flows)
     d sqrt(R)/dw = dR/dw / (2 sqrt(R))
 
 sqrt(R) is one global scalar, so it rescales every coordinate by the same
-factor and the relative gain^2 weighting between coordinates is preserved.
-Both forms pull each weight toward its NEAREST grid point, both have V = 0
-there and V = 1/4 at the boundary -- an identical barrier height, which is
-what makes lam comparable across the arms -- and the boundary is an exact
-equilibrium in both.
+factor and the relative gain weighting between coordinates is preserved. All
+three profiles pull each weight toward its NEAREST grid point and all three
+have V = 0 there and V = 1/4 at the boundary -- an identical barrier height,
+which is what keeps lam on a comparable footing.
 
-They differ in WHERE the force lives, and that contrast is why both exist:
+Where the force LIVES is the whole contrast:
 
-    u        V(sr)    dV/du(sr)     V(cos2)   dV/du(cos2)
-    0.00     0.0000   +1.0000       0.0000    +0.0000
-    0.10     0.0900   +0.8000       0.0239    +0.4616
-    0.25     0.1875   +0.5000       0.1250    +0.7854
-    0.40     0.2400   +0.2000       0.2261    +0.4616
-    0.50     0.2500    0.0000       0.2500    +0.0000
+    u        |dV/du| nagel    |dV/du| sr    |dV/du| cos2
+    0.00     0.000            1.000         0.000          <- grid point
+    0.10     0.200            0.800         0.462
+    0.25     0.500            0.500         0.785          <- cos2 peaks
+    0.40     0.800            0.200         0.462
+    0.50     1.000            0.000         0.000          <- boundary
 
-  sr    force is MAXIMAL at the grid point (V is a V-shaped well with a kink)
-        and falls linearly to zero at the boundary. L1-like: a settled weight
-        keeps feeling a constant-magnitude pull that flips sign as it crosses,
-        so it jitters around the grid point with amplitude set by lr.
-  cos2  force is zero at the grid point AND at the boundary, peaking mid-bin
-        at |u| = 0.25. C^infinity everywhere. Settled weights are left alone
-        and the force acts on weights genuinely between levels.
+  nagel  convex well. Zero force at the grid point, maximal at the boundary:
+         pushes hardest on the weights furthest from settling.
+  sr     concave, and the mirror of nagel. Maximal force at the grid point (a
+         cusp), zero at the boundary. L1-like, so a settled weight keeps
+         feeling a constant-magnitude pull that flips sign as it crosses and
+         jitters with amplitude set by lr.
+  cos2   zero at BOTH ends, peaking mid-bin. C^infinity. Settled weights are
+         left alone and the force acts on weights genuinely between levels.
 
-Peak |dV/du| differs by 4/pi (1.0 against 0.785) while the barrier matches, so
-equal lam gives comparable but not identical strength. Match force_ratio, not
-lam, when comparing the arms.
+Peak |dV/du| is 1.0, 1.0 and pi/4 = 0.785, so equal lam gives comparable but
+not identical strength. Match force_ratio, not lam, when comparing profiles.
 
 WHY ONE PASS. The continuous analogue is a gradient-norm penalty whose
 gradient is a Hessian-vector product -- a second backward, so no cheaper than
@@ -102,19 +108,68 @@ quantization grid breaks that invariance and materialises half the variance as
 geometry, p(1-p), a direct function of w. Differentiating that channel alone
 is free.
 
-RELATION TO PRIOR WORK. Drop the gain^2 weight from the SR form and
-sum_i r_i(1-r_i) is the oscillation-dampening penalty of Nagel et al. 2022.
-That heuristic is the special case with uniform sensitivity; what QVR adds is
-a sensitivity weight, derived rather than assumed.
+RELATION TO PRIOR WORK. The oscillation-dampening penalty of Nagel et al.
+2022 is L_dampen = ||w_hat - clip(w)||^2, i.e. V = u^2, available here as
+measure="nagel". It is NOT what QVR-sr reduces to when the gain weight is
+removed -- the two are near mirror images in where the force lives:
 
-DECOUPLED, AND IN TWO PHASES. The update is applied as
-w -= lr * lam * d sqrt(R)/dw, outside the optimizer rather than added to
-weight.grad: Adam normalises by its own second-moment estimate, so a coupled
-penalty saturates -- once it dominates the gradient, lam cancels against the
-lam inside sqrt(v) and the update stops depending on lam at all. Same fix
-AdamW makes for L2.
+    u          |dV/du| nagel    |dV/du| sr
+    0.00       0.000            1.000        <- grid point
+    0.25       0.500            0.500        <- they cross here
+    0.50       1.000            0.000        <- boundary
 
-That forces the split into stage() and apply():
+nagel is a convex well: zero force at the grid point, maximal at the boundary,
+so it pushes hardest on weights that are furthest from settling. sr is
+concave: maximal force at the grid point, zero at the boundary. So
+gain="const" with measure="sr" is "QVR-sr minus the sensitivity weight", an
+ablation isolating what gain^2 contributes -- NOT a reproduction of prior
+work, and it must not be reported as one.
+
+One difference survives even measure="nagel". Nagel's penalty is separable,
+sum_i u_i^2; QVR is sqrt(sum_i V_i gain_i^2), and the global square root
+couples every coordinate through a shared denominator. gain="const" removes
+the sensitivity weighting but not that coupling.
+
+TWO ABLATION AXES
+-----------------
+`gain` replaces the sensitivity weight on V(u):
+
+    "sq"     (g*step)^2   the derivation; R is the loss variance
+    "abs"    |g*step|      square-root sensitivity, less peaked
+    "const"  1             no sensitivity at all. NOT prior work -- see
+                           RELATION TO PRIOR WORK; use measure="nagel" for that
+
+Only "sq" makes sqrt(R) a standard deviation; the others keep the identical
+machinery and change the weighting alone, which is what makes them an ablation
+rather than a different method.
+
+`apply` chooses where the term lands, and under Adam the two are genuinely
+different methods, not an implementation detail:
+
+    "decoupled"  w -= lr * lam * d sqrt(R)/dw, outside the optimizer
+    "coupled"    weight.grad += lam * d sqrt(R)/dw, before optimizer.step()
+
+Decoupled keeps its own scale, so lam is monotone under any optimizer -- the
+fix AdamW makes for L2 -- but Adam normalises the TASK update to ~lr per
+coordinate while leaving the penalty proportional to the raw gradient. As
+training converges and ||g|| falls, the penalty's displacement falls with it
+and the task's does not, so the intervention fades exactly when crystallisation
+matters most. Measured on a real run at epoch 91 with lam=1, cos2: force_ratio
+3.7e-3 but pull_per_step 3.6e-9 bins, i.e. ~1e-4 of a bin over the rest of
+training -- inert.
+
+Coupled fixes that: the optimizer normalises the SUM, so the penalty holds a
+fixed share of the update set by force_ratio, whatever the gradient scale. The
+price is saturation -- once the penalty DOMINATES, lam cancels against the lam
+inside sqrt(v) and the update stops depending on lam. That only bites well
+outside the intended regime (force_ratio ~ 0.05), where coupled is the better
+behaved of the two.
+
+Read force_ratio under "coupled" and pull_per_step under "decoupled";
+pull_per_step is reported as NaN under "coupled" because the displacement is
+then whatever the optimizer makes of the summed gradient.
+
+STAGED IN TWO PHASES either way:
 
     loss.backward()
     qvr.stage()          # gain AND geometry, both read at w_t
@@ -161,19 +216,49 @@ import torch
 from .func import QuanConv2d, QuanLinear
 from .quantizer import LSQ
 
-MEASURES = ("sr", "cos2")
+MEASURES = ("nagel", "sr", "cos2")
+GAINS = ("sq", "abs", "const")
+APPLIES = ("decoupled", "coupled")
+
+
+def _gain_weight(g, step, gain):
+    """The sensitivity weight multiplying V(u), per coordinate.
+
+    "sq" is the derived one -- R is then the loss variance and lam*sqrt(R) its
+    standard deviation. The other two are ablations on that weighting alone,
+    everything downstream unchanged:
+
+        sq     (g*step)^2    the derivation
+        abs    |g*step|      square-root sensitivity, less peaked
+        const  1             no sensitivity at all -- with measure="sr" this
+                             is exactly the oscillation-dampening penalty of
+                             Nagel et al. 2022, so it is the prior-work arm
+    """
+    if gain == "sq":
+        return (g * step).pow(2)
+    if gain == "abs":
+        return (g * step).abs()
+    return torch.ones_like(g)
 
 
 def _level_variance(u, measure):
-    """Variance of the level offset, and its derivative, as functions of u.
+    """The V profile and its derivative, as functions of u.
 
     u is the signed distance to the nearest grid point in units of step, so
     u in [-0.5, 0.5] and the rounding boundaries are at +-0.5. Returns
-    (V, dV/du). Neither arm has a width parameter.
+    (V, dV/du). None of the three has a width parameter.
+
+    "sr" and "cos2" really are level-offset variances. "nagel" is NOT -- it is
+    the prior-work dampening penalty put through the same machinery, kept here
+    so the comparison runs on identical code.
 
     Kept a free function so the self-check exercises exactly this code rather
     than a re-derivation of it.
     """
+    if measure == "nagel":
+        # L_dampen = ||w_hat - clip(w)||^2 of Nagel et al. 2022, in bin units.
+        return u * u, 2.0 * u
+
     if measure == "sr":
         p = u.abs()
         # torch.sign(0) == 0, so u == 0 returns the 0 subgradient of the kink.
@@ -188,14 +273,21 @@ def _level_variance(u, measure):
 
 
 class QVR:
-    def __init__(self, model, lam=0.0, measure="sr", eps=1e-12):
+    def __init__(self, model, lam=0.0, measure="sr", gain="sq",
+                 apply_mode="decoupled", eps=1e-12):
         if lam < 0.0:
             raise ValueError("lam must be non-negative, got {}".format(lam))
         if measure not in MEASURES:
             raise ValueError("measure must be one of {}, got {!r}".format(MEASURES, measure))
+        if gain not in GAINS:
+            raise ValueError("gain must be one of {}, got {!r}".format(GAINS, gain))
+        if apply_mode not in APPLIES:
+            raise ValueError("apply must be one of {}, got {!r}".format(APPLIES, apply_mode))
 
-        self.lam = float(lam)  # the only hyperparameter, in both arms
+        self.lam = float(lam)
         self.measure = measure
+        self.gain = gain
+        self.apply_mode = apply_mode
         self.eps = float(eps)
         self.stats = {}
         self._staged = []
@@ -240,10 +332,10 @@ class QVR:
             if not torch.isfinite(g).all():
                 continue
             step, var, dvar, valid = self._geometry(module)
-            gain2 = (g * step).pow(2)
-            R += float((var * gain2)[valid].double().sum().item())
+            wgt = _gain_weight(g, step, self.gain)
+            R += float((var * wgt)[valid].double().sum().item())
             g_sq += float(g.double().pow(2).sum().item())
-            pending.append((module, torch.where(valid, gain2 * dvar, torch.zeros_like(g)), step))
+            pending.append((module, torch.where(valid, wgt * dvar, torch.zeros_like(g)), step))
 
         std = math.sqrt(max(R, 0.0))
         # Floor matters: as the network crystallises R -> 0 and a raw 1/sqrt(R)
@@ -253,31 +345,47 @@ class QVR:
         force_sq, pull, n = 0.0, 0.0, 0
         for module, dR, step in pending:
             delta = dR * scale
-            self._staged.append((module, delta))
             force_sq += float(delta.double().pow(2).sum().item())
             # step broadcasts, so this stays right for a per-channel step_size.
             pull += float((delta.double().abs() / step.double()).sum().item())
             n += delta.numel()
+            if self.apply_mode == "coupled":
+                # Ride the optimizer: Adam then normalises the SUM, so the
+                # penalty keeps a fixed share of the update as the task
+                # gradient decays. apply() has nothing left to do.
+                module.weight.grad.add_(delta.to(module.weight.grad.dtype))
+            else:
+                self._staged.append((module, delta))
 
         self.stats = {
             "lam": self.lam,
             "std": std,
-            # Penalty gradient next to the task gradient. Scale-free reference.
+            # Share of the raw gradient the penalty contributes. This IS the
+            # operative knob under apply="coupled", where the optimizer
+            # normalises the sum and only the ratio survives.
             "force_ratio": (force_sq ** 0.5) / (g_sq ** 0.5) if g_sq > 0 else float("nan"),
             # Fraction of a quantization bin the penalty drags a weight per
-            # step. This is the number to tune lam by. Filled in by apply().
+            # step. Only defined for apply="decoupled" -- under "coupled" the
+            # displacement is whatever the optimizer makes of the summed
+            # gradient, so reporting lr*|delta| there would be a fiction.
             "pull_per_step": float("nan"),
             "_pull_unit_lr": pull / n if n else float("nan"),
         }
 
     @torch.no_grad()
     def apply(self, lr):
-        """Apply the staged update. Call right after optimizer.step()."""
+        """Write the decoupled update. Call right after optimizer.step().
+
+        A no-op under apply="coupled", where stage() already added the term to
+        weight.grad and the optimizer has consumed it.
+        """
         for module, delta in self._staged:
             module.weight.data.add_(delta, alpha=-lr)
         self._staged = []
         if self.stats:
-            self.stats["pull_per_step"] = self.stats.pop("_pull_unit_lr") * lr
+            unit = self.stats.pop("_pull_unit_lr")
+            if self.apply_mode == "decoupled":
+                self.stats["pull_per_step"] = unit * lr
 
     def summary(self):
         if not self.stats:
@@ -330,10 +438,14 @@ def _self_check():
         force = -_level_variance(u, measure)[1]
         assert force[0] > 0 and force[1] < 0, (measure, "must restore to u=0")
 
-    # 4. Where the force lives -- the whole point of having two arms.
-    #    cos2 switches off AT the grid point; sr is maximal there. sr has to
-    #    be probed in the limit because torch.sign(0) == 0 hands back the 0
-    #    subgradient of the kink, which is admissible but not the force.
+    # 4. Where the force lives -- the whole point of having three profiles.
+    #    sr has to be probed in the limit at u=0 because torch.sign(0) == 0
+    #    hands back the 0 subgradient of the cusp, admissible but not the force.
+    WANT = {  # (grid point, boundary)
+        "nagel": ("zero", "max"),
+        "sr": ("max", "zero"),
+        "cos2": ("zero", "zero"),
+    }
     for measure in MEASURES:
         peak = _level_variance(grid, measure)[1].abs().max().item()
         at0 = _level_variance(torch.zeros(1, dtype=torch.float64), measure)[1].abs().item()
@@ -341,14 +453,25 @@ def _self_check():
             torch.tensor([-1e-9, 1e-9], dtype=torch.float64), measure)[1].abs().max().item()
         edge = _level_variance(
             torch.tensor([-0.5, 0.5], dtype=torch.float64), measure)[1].abs().max().item()
-        if measure == "cos2":
-            assert at0 <= 1e-12 * peak, (measure, "grid point must be force-free", at0 / peak)
-            assert near0 <= 1e-7 * peak, (measure, "and smoothly so", near0 / peak)
+        want_grid, want_edge = WANT[measure]
+        if want_grid == "zero":
+            assert at0 <= 1e-12 * peak, (measure, "grid point force-free", at0 / peak)
         else:
             assert near0 >= (1.0 - 1e-6) * peak, (measure, "grid point maximal", near0 / peak)
-        assert edge <= 1e-12 * peak, (measure, "boundary must be force-free", edge / peak)
-        print("  {:<5s} peak|dV/du|={:.4f}  |force|/peak just off the grid point={:.3f}"
-              "  at boundary={:.1e}".format(measure, peak, near0 / peak, edge / peak))
+        if want_edge == "zero":
+            assert edge <= 1e-12 * peak, (measure, "boundary force-free", edge / peak)
+        else:
+            assert edge >= (1.0 - 1e-6) * peak, (measure, "boundary maximal", edge / peak)
+        print("  {:<5s} peak|dV/du|={:.4f}  |force|/peak: grid point={:.3f} ({})"
+              "  boundary={:.3f} ({})".format(
+                  measure, peak, near0 / peak, want_grid, edge / peak, want_edge))
+
+    # nagel and sr are near mirror images: they cross at |u| = 1/4.
+    q = torch.tensor([0.25], dtype=torch.float64)
+    dn = abs(float(_level_variance(q, "nagel")[1]))
+    ds = abs(float(_level_variance(q, "sr")[1]))
+    assert abs(dn - 0.5) < 1e-12 and abs(ds - 0.5) < 1e-12, (dn, ds)
+    print("  nagel vs sr cross at |u|=0.25: both |dV/du| = {:.3f}".format(dn))
 
     # 5. Barrier height is identical, which is what makes lam comparable.
     for measure in MEASURES:
@@ -391,6 +514,17 @@ def _self_check():
     assert (tpdf - 0.25).abs().max().item() < 1e-12
     print("  TPDF (2 LSB): max|V - 1/4| = {:.1e}  -> position signal gone".format(
         (tpdf - 0.25).abs().max().item()))
+
+    # 7. gain ablations: the weight multiplying V, everything else identical.
+    #    "const" + "sr" reproduces the Nagel dampening penalty exactly.
+    g = torch.randn(2048, dtype=torch.float64)
+    step = torch.tensor(0.3, dtype=torch.float64)
+    w = {name: _gain_weight(g, step, name) for name in GAINS}
+    assert torch.allclose(w["sq"], (g * step) ** 2)
+    assert torch.allclose(w["abs"], (g * step).abs())
+    assert torch.equal(w["const"], torch.ones_like(g))
+    assert torch.allclose(w["sq"], w["abs"] ** 2), "abs must be the sqrt of sq"
+    print("  gain weights: sq=|g*step|^2, abs=|g*step|, const=1  (abs^2 == sq)")
 
     print("qvr self-check OK")
 

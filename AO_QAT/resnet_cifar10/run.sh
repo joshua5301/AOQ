@@ -3,7 +3,8 @@
 #   e.g. bash AO_QAT/resnet_cifar10/run.sh resnet20 2 True
 # Runnable from any working directory, including the repo root.
 #
-# Env overrides: LOSS, W_QUANTIZER, QVR_LAMBDA, QVR_MEASURE,
+# Env overrides: LOSS, W_QUANTIZER, QVR_LAMBDA, QVR_MEASURE, QVR_GAIN,
+#                QVR_APPLY,
 #                OPTIMIZER, EPOCHS, BATCH_SIZE, LR, WEIGHT_DECAY, MOMENTUM,
 #                SAVE, RESUME, PYTHON
 #
@@ -18,12 +19,20 @@
 #
 #   QVR_LAMBDA=10 bash AO_QAT/resnet_cifar10/run.sh resnet20 2
 #   QVR_LAMBDA=10 QVR_MEASURE=cos2 bash AO_QAT/resnet_cifar10/run.sh resnet20 2
+#   QVR_LAMBDA=10 QVR_MEASURE=nagel bash .../run.sh resnet20 2   # prior work
+#   QVR_LAMBDA=10 QVR_APPLY=coupled QVR_GAIN=const bash .../run.sh resnet20 2
 #
-# Tune QVR_LAMBDA by the logged pull/step -- the fraction of a quantization bin
-# the penalty drags a weight in one step. A 250-epoch run at batch 256 is ~49k
-# steps, so pull/step ~ 2e-5 is roughly "one bin over the whole run".
-# QVR_LAMBDA is the only QVR hyperparameter -- neither measure has a width
-# knob. Match force_ratio, not lambda, when comparing sr against cos2.
+# Tune QVR_LAMBDA by the logged force/grad -- the share of the raw gradient the
+# penalty contributes. It is exactly linear in QVR_LAMBDA, so one probe epoch
+# fixes the scale. Target 0.05, useful band roughly [0.02, 0.5].
+#
+# Do NOT tune by pull/step: it drifts with the weight distribution as training
+# settles (a real run fell 56x between epoch 0 and 91 at fixed lambda), so it
+# is a diagnostic, not a knob. It is also undefined under QVR_APPLY=coupled.
+#
+# QVR_MEASURE picks the V profile: sr peaks at the grid point, cos2 mid-bin,
+# nagel at the boundary (the prior-work dampening penalty). Their peak forces
+# differ, so compare arms at matched force/grad, not matched QVR_LAMBDA.
 set -e
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
@@ -40,6 +49,8 @@ WEIGHT_DECAY=${WEIGHT_DECAY:-0}
 MOMENTUM=${MOMENTUM:-0.9}
 QVR_LAMBDA=${QVR_LAMBDA:-0}
 QVR_MEASURE=${QVR_MEASURE:-sr}
+QVR_GAIN=${QVR_GAIN:-sq}
+QVR_APPLY=${QVR_APPLY:-decoupled}
 PYTHON=${PYTHON:-python3}
 
 # QVR is defined on a uniform grid, so it implies the LSQ quantizer.
@@ -60,6 +71,8 @@ if [ "${W_QUANTIZER}" != "aoq" ]; then TAG=${TAG}_${W_QUANTIZER}; fi
 if [ "${LOSS}" != "kd" ]; then TAG=${TAG}_${LOSS}; fi
 if [ "${QVR_LAMBDA}" != "0" ]; then
     TAG=${TAG}_qvr${QVR_LAMBDA_G}_${QVR_MEASURE}
+    if [ "${QVR_GAIN}" != "sq" ]; then TAG=${TAG}_${QVR_GAIN}; fi
+    if [ "${QVR_APPLY}" != "decoupled" ]; then TAG=${TAG}_${QVR_APPLY}; fi
 fi
 if [ "${OPTIMIZER}" != "adam" ]; then TAG=${TAG}_${OPTIMIZER}; fi
 RESUME_FLAG=""
@@ -76,6 +89,8 @@ echo "[run] ${TAG}  epochs=${EPOCHS} loss=${LOSS} quantizer=${W_QUANTIZER} optim
     --loss="${LOSS}" \
     --qvr_lambda="${QVR_LAMBDA}" \
     --qvr_measure="${QVR_MEASURE}" \
+    --qvr_gain="${QVR_GAIN}" \
+    --qvr_apply="${QVR_APPLY}" \
     --optimizer="${OPTIMIZER}" \
     --epochs="${EPOCHS}" \
     --batch_size="${BATCH_SIZE}" \

@@ -37,7 +37,9 @@ Everything else is an env var, set inline before `bash`:
 | `LOSS` | `kd` | `kd` distills from the teacher, `ce` uses the hard labels |
 | `W_QUANTIZER` | `aoq` | weight quantizer; `lsq` is the uniform baseline |
 | `QVR_LAMBDA` | `0` | QVR penalty weight (0 = off); implies `W_QUANTIZER=lsq` |
-| `QVR_MEASURE` | `sr` | `sr` or `cos2`; neither has a width knob |
+| `QVR_MEASURE` | `sr` | `sr`, `cos2`, or `nagel`; none has a width knob |
+| `QVR_GAIN` | `sq` | sensitivity weight: `sq`, `abs`, or `const` |
+| `QVR_APPLY` | `decoupled` | `decoupled` or `coupled` (into `weight.grad`) |
 | `OPTIMIZER` | `adam` | `adam`, `adamw`, or `sgd` |
 | `EPOCHS` | `250` | training epochs |
 | `BATCH_SIZE` | `256` | |
@@ -61,32 +63,76 @@ forward pass each step.
 ### QVR
 
 Quantization-aware Variance Regularization penalises `L + lam*sqrt(R)`, with
-`R = sum p(1-p) gain^2` the rounding-induced loss variance. It needs a uniform
-grid, so `W_QUANTIZER=lsq` is set for you when it is on.
+`R = sum V(u) * gain^2` the rounding-induced loss variance and `u` the signed
+distance to the nearest grid point. It needs a uniform grid, so
+`W_QUANTIZER=lsq` is set for you when it is on.
 
 ```python
-!QVR_LAMBDA=10 bash AO_QAT/resnet_cifar10/run.sh resnet20 2
-!QVR_LAMBDA=10 QVR_MEASURE=cos2 bash AO_QAT/resnet_cifar10/run.sh resnet20 2
+!QVR_LAMBDA=14 bash AO_QAT/resnet_cifar10/run.sh resnet20 2
+!QVR_LAMBDA=14 QVR_MEASURE=cos2 bash AO_QAT/resnet_cifar10/run.sh resnet20 2
 ```
 
 It adds one line per epoch:
 
 ```
-qvr    epoch   0  lambda 1.0000e+01  std 8.1e-01  force/grad 1.02e-01  pull/step 1.55e-06
+qvr    epoch   0  lambda 1.4000e+01  std 8.1e-01  force/grad 5.1e-02  pull/step 1.55e-06
 ```
 
-`QVR_LAMBDA` is QVR's **only** hyperparameter — neither measure has a width
-knob. Tune it by `pull/step`, the fraction of a quantization bin the penalty
-drags a weight in one step: a 250-epoch run at batch 256 is ~49k steps, so
-`pull/step ~ 2e-5` is roughly "one bin over the whole run". `force_ratio` near
-0.05 is the other target, and it is exactly linear in `QVR_LAMBDA`, so one
-probe epoch is enough to rescale.
+**Tune by `force/grad`**, the share of the raw gradient the penalty
+contributes. It is exactly linear in `QVR_LAMBDA`, so one probe epoch fixes
+the scale. Target `0.05`; the useful band is roughly `[0.02, 0.5]`.
 
-The two measures differ in where the force acts: `sr` is maximal at the grid
-point (a kink, so settled weights keep jittering), `cos2` is zero there and
-peaks mid-bin (settled weights are left alone). Their barrier heights are
-identical, but peak force differs by `4/pi`, so **compare arms at matched
-`force_ratio`, not matched `QVR_LAMBDA`**.
+Do **not** tune by `pull/step`. It drifts with the weight distribution as
+training settles — a real run fell 56x between epoch 0 and epoch 91 at fixed
+`QVR_LAMBDA` — so it is a diagnostic, not a knob, and it is undefined under
+`QVR_APPLY=coupled`.
+
+#### `QVR_MEASURE` — where the force acts
+
+All three have `V = 0` at the grid point and `V = 1/4` at the boundary, so the
+barrier height is identical. They differ in where the force lives:
+
+| `\|dV/du\|` | `u=0` (grid point) | `u=0.25` | `u=0.5` (boundary) |
+|---|---|---|---|
+| `nagel` | 0.000 | 0.500 | 1.000 |
+| `sr` | 1.000 | 0.500 | 0.000 |
+| `cos2` | 0.000 | 0.785 | 0.000 |
+
+- `sr` — stochastic rounding, `V = |u|(1-|u|)`. Maximal force at the grid
+  point (a cusp), so settled weights keep jittering.
+- `cos2` — `V = sin^2(pi u)/4`, the leading Fourier mode of a Gaussian jitter
+  and its width-independent limit. Zero force at both ends, peaks mid-bin, so
+  settled weights are left alone.
+- `nagel` — `V = u^2`, the oscillation-dampening penalty of Nagel et al. 2022.
+  Roughly `sr`'s mirror image: zero force at the grid point, maximal at the
+  boundary. **This is the prior-work arm.**
+
+`QVR_GAIN=const` is *not* prior work — it is "QVR minus the sensitivity
+weight", an ablation isolating what `gain^2` contributes. Use
+`QVR_MEASURE=nagel` for the literature comparison. (Even that is not identical:
+Nagel's penalty is separable, `sum_i u_i^2`, while QVR's global `sqrt` couples
+every coordinate through a shared denominator.)
+
+Peak forces differ across profiles, so **compare arms at matched `force/grad`,
+not matched `QVR_LAMBDA`**. Measured starting points for `force/grad = 0.05`
+at init: `nagel` ~3.6, `cos2` ~4.4, `sr` ~5.3 — but `force/grad` falls as
+training settles, so aim higher (~14) if you want 0.05 at the *end*.
+
+#### `QVR_APPLY` — coupled or decoupled
+
+`decoupled` (default) writes `w -= lr*lam*grad` outside the optimizer, so
+`lam` stays monotone under any optimizer — the fix AdamW makes for L2.
+`coupled` adds the term to `weight.grad` so the optimizer normalises the sum;
+that holds the penalty at a fixed share of the update, at the cost of
+saturating once it dominates. Read `force/grad` for both, `pull/step` only for
+`decoupled`.
+
+#### `QVR_GAIN` — the sensitivity weight
+
+`sq` (`(g*step)^2`) is the derived one and the only choice for which
+`sqrt(R)` is a standard deviation. `abs` and `const` keep the identical
+machinery and change the weighting alone. Note `const` needs a much smaller
+`QVR_LAMBDA` — the weights are ~60x larger — so re-probe `force/grad`.
 
 `adamw` with `WEIGHT_DECAY=0` is exactly Adam — the only difference between
 them is how the decay term is applied, so it does nothing at 0. `sgd` needs its
